@@ -888,49 +888,94 @@ def _identify_left_right(groups: list[str]) -> tuple[str, str]:
     return left_candidates[0], right_candidates[0]
 
 
+def _ambiguous_arm_error(candidate_groups: list[str]) -> ValueError:
+    """候选 group 无法唯一判定为机械臂时抛出，列出候选并要求显式指定。
+
+    候选中可能混入了 torso 等非臂 chain group，因此不在自动分支里做猜测。
+    """
+    listed = ", ".join(candidate_groups) or "(none)"
+    return ValueError(
+        "无法唯一确定机械臂 planning group（候选中可能混入了 torso 等非臂 group）: "
+        f"[{listed}]。\n"
+        "请显式指定：单臂用 --arm-group <group>；"
+        "双臂用 --left-arm-group <left> --right-arm-group <right>。"
+    )
+
+
+def _resolve_dual_groups(candidate_groups: list[str]) -> tuple[str, str]:
+    """从候选中解析 left/right，失败则给出带显式选项的歧义错误。"""
+    try:
+        return _identify_left_right(candidate_groups)
+    except ValueError as exc:
+        raise _ambiguous_arm_error(candidate_groups) from exc
+
+
 def _detect_arm_type(
     o3de_config: dict[str, Any],
     chains: dict[str, str],
     kinematics: dict[str, Any],
+    *,
+    arm_group: str | None = None,
+    left_arm_group: str | None = None,
+    right_arm_group: str | None = None,
 ) -> tuple[str, list[str]]:
     """检测 arm_type 和选中的 arm groups。
 
-    优先从 o3de_config 读取；否则从 SRDF chain 数量自动检测。
-    返回 (arm_type, arm_groups)。
+    优先级：显式 CLI 参数 > prefab config 的 arm_type > 无歧义时自动判定。
+    候选 = 同时出现在 kinematics.yaml 且 SRDF 有 <chain> 的 group（可能混入 torso），
+    因此有歧义时不再猜测，而是要求显式指定。
+    返回 (arm_type, arm_groups)，dual 时顺序固定为 [left, right]。
     """
-    all_groups = list(kinematics.keys())
-    arm_groups = [g for g in all_groups if g in chains]
+    candidate_groups = [g for g in kinematics if g in chains]
 
-    if not arm_groups:
+    # 1) 显式双臂
+    if left_arm_group or right_arm_group:
+        if arm_group:
+            raise ValueError("--arm-group 不能与 --left-arm-group/--right-arm-group 同时使用")
+        if not (left_arm_group and right_arm_group):
+            raise ValueError("双臂必须同时提供 --left-arm-group 和 --right-arm-group")
+        unknown = [g for g in (left_arm_group, right_arm_group) if g not in chains]
+        if unknown:
+            raise ValueError(
+                f"指定的 group 不在 SRDF <chain> 中: {unknown}；候选项: {candidate_groups}"
+            )
+        return "dual", [left_arm_group, right_arm_group]
+
+    # 2) 显式单臂
+    if arm_group:
+        if arm_group not in chains:
+            raise ValueError(
+                f"指定的 group 不在 SRDF <chain> 中: {arm_group}；候选项: {candidate_groups}"
+            )
+        return "single", [arm_group]
+
+    if not candidate_groups:
         raise ValueError(
-            f"Cannot identify arm planning group: "
-            f"kinematics groups={all_groups}, "
-            f"SRDF chain groups={list(chains)}"
+            "无法从 SRDF/kinematics 识别任何机械臂 group（chain ∩ kinematics 为空）；"
+            "请用 --arm-group 或 --left/right-arm-group 指定。"
         )
 
-    arm_type = o3de_config.get("arm_type")
-    if not arm_type:
-        if len(arm_groups) == 1:
-            arm_type = "single"
-            print(f"[custom robot] Auto-detected arm_type: single (1 arm group: {arm_groups[0]})")
-        elif len(arm_groups) == 2:
-            try:
-                _identify_left_right(arm_groups)
-                arm_type = "dual"
-                print(f"[custom robot] Auto-detected arm_type: dual (groups: {arm_groups})")
-            except ValueError:
-                raise ValueError(
-                    f"Found 2 arm groups but cannot identify left/right: {arm_groups}. "
-                    f"Please specify arm_type in prefab config, or rename groups to contain 'left'/'right'."
-                )
-        else:
-            raise ValueError(
-                f"Cannot auto-detect arm_type: found {len(arm_groups)} arm groups: {arm_groups}. "
-                f"Expected 1 (single) or 2 (dual). "
-                f"Please specify arm_type in prefab config."
-            )
+    # 3) prefab config 显式声明
+    configured = o3de_config.get("arm_type")
+    if configured is not None and configured not in ("single", "dual"):
+        raise ValueError(f"Invalid arm_type in prefab config: {configured!r}")
+    if configured == "single":
+        if len(candidate_groups) != 1:
+            raise _ambiguous_arm_error(candidate_groups)
+        return "single", candidate_groups
+    if configured == "dual":
+        left, right = _resolve_dual_groups(candidate_groups)
+        return "dual", [left, right]
 
-    return arm_type, arm_groups
+    # 4) 自动判定：仅当无歧义
+    if len(candidate_groups) == 1:
+        print(f"[custom robot] Auto-detected arm_type: single (group: {candidate_groups[0]})")
+        return "single", candidate_groups
+    if len(candidate_groups) == 2:
+        left, right = _resolve_dual_groups(candidate_groups)
+        print(f"[custom robot] Auto-detected arm_type: dual (groups: [{left}, {right}])")
+        return "dual", [left, right]
+    raise _ambiguous_arm_error(candidate_groups)
 
 
 def _runtime_arm_prefix(arm_side: str | None = None) -> str:
@@ -1124,13 +1169,13 @@ def write_robot_profile(
         task_class = SINGLE_TASK
         selected_groups = [group]
     elif arm_type == "dual":
-        # 从 SRDF 自动检测 left/right
-        if len(arm_groups) == 2:
-            left, right = _identify_left_right(arm_groups)
-        else:
+        # arm_groups 顺序由 _detect_arm_type 保证为 [left, right]（显式或自动）。
+        # 这里不再按名称二次判左右，否则显式指定的自定义 group 名会被误判。
+        if len(arm_groups) != 2:
             raise ValueError(
                 f"arm_type=dual requires exactly 2 arm groups, but found {len(arm_groups)}: {arm_groups}."
             )
+        left, right = arm_groups
         task_class = DUAL_TASK
         selected_groups = [left, right]
     else:
@@ -1298,7 +1343,14 @@ def patch_package(root: Path, reference: dict[str, Any], args: argparse.Namespac
         o3de_config = load_yaml(o3de_config_path)
         chains = _parse_srdf_chains(package_path, robot)
         kinematics = load_yaml(package_path / "config" / "kinematics.yaml")
-        arm_type, arm_groups = _detect_arm_type(o3de_config, chains, kinematics)
+        arm_type, arm_groups = _detect_arm_type(
+            o3de_config,
+            chains,
+            kinematics,
+            arm_group=args.arm_group,
+            left_arm_group=args.left_arm_group,
+            right_arm_group=args.right_arm_group,
+        )
         print(f"[patch] Detected arm_type={arm_type}, arm_groups={arm_groups}")
 
         if gripper_path:
@@ -1472,6 +1524,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="robot_profile.yaml 输出路径（默认输出到 package-path 同级目录）",
     )
     parser.add_argument("--skip-robot-profile", action="store_true", help="不生成 robot_profile.yaml")
+    parser.add_argument(
+        "--arm-group",
+        help="显式指定单臂 planning group 名。用于单臂+torso 等候选有歧义、无法自动判定的情况。",
+    )
+    parser.add_argument(
+        "--left-arm-group",
+        help="显式指定左臂 planning group 名（双臂）。须与 --right-arm-group 成对使用。",
+    )
+    parser.add_argument(
+        "--right-arm-group",
+        help="显式指定右臂 planning group 名（双臂）。须与 --left-arm-group 成对使用。",
+    )
     parser.add_argument(
         "--gripper-controller-path",
         help="夹爪 controller package 的路径，用于扫描 C++ 源码得到夹爪命令 topic。"

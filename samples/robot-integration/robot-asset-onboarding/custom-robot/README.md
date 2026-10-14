@@ -27,12 +27,19 @@ Assets/robots/robot_ur5e/
 需要手动填写，机器人元信息。`robot_type` 标识机器人类型；`record_topic` 列出在数据回灌/同步录制时需要订阅的关键 ROS topic（包括关节状态、控制器命令、相机图像等）。
 
 ### `robot_profile.yaml`
-无需手动填写，运行 `patch_moveit_config.py` 自动生成的机器人档案，描述机械臂构型（`single`）、MoveIt 配置包名、MoveIt 演示启动文件、任务类入口，以及臂/夹爪的 planning group、service 名称、控制器 topic、base/tool link 等关键映射参数。**请勿手工修改**，配置变更后重新运行 patch 脚本。
+无需手动填写，运行 `patch_moveit_config.py` 自动生成的机器人档案，描述机械臂构型（`single`）、MoveIt 配置包名、MoveIt 演示启动文件、任务类入口，以及臂/夹爪的 planning group、service 名称、控制器 topic、base/tool link 等关键映射参数。**请勿手工修改**，配置变更后重新运行 patch 脚本。机械臂 planning group 的识别规则见下方[《机械臂 planning group 约定》](#机械臂-planning-group-约定)。
 
 ### `ur5e.yaml`
 需要手动填写，机器人控制器映射与初始位姿：
 - `fixed_base` / `moveit_controller`：底盘 link 与 MoveIt 主控制器名。
-- `topic_controller`：定义 arm 与 hand 各关节对应的 ROS topic 与关节名。
+- `topic_controller`：定义各角色对应的控制器映射。
+  - `arm`（单臂）/ `left_arm` + `right_arm`（双臂）：机械臂的低层命令 topic 与关节名。
+  - `hand`（单臂）/ `left_gripper` + `right_gripper`（双臂）：夹爪配置，字段包括：
+    - `topic_name`：**低层**关节命令 topic（`Float64MultiArray`，生成的控制器发布到此）。
+    - `joint_names`：关节名，同时决定 `Float64MultiArray` 的输出顺序。
+    - `gripper_command_topic`：**高层**夹爪命令 topic（`Float64`，`0.1=开 / 0.0=关`，生成的控制器订阅此 topic）。
+    - `gripper_positions.open` / `.close`：每个关节在开/关时的目标值，用于生成线性映射。
+  - `generate_gripper_controller.py` 会读取上述夹爪字段，生成 `ur5e_gripper_controller/src/*.cpp`。
 - `init_joints`：6 个臂关节 + 2 个夹爪手指关节的初始角度（弧度）。
 
 ### `r2c_ur5e.yaml`
@@ -44,6 +51,40 @@ Assets/robots/robot_ur5e/
 
 ### `robot_ur5e.prefab`
 无需手动填写，ME自动生成的机器人prefab文件，整合机器人视觉外观、物理碰撞体、关节绑定与脚本引用。
+
+---
+
+## 机械臂 planning group 约定
+
+`patch_moveit_config.py` 生成 `robot_profile.yaml` 时，需要确定哪些 MoveIt planning group 是机械臂。
+
+候选 = **同时**满足以下两个条件的 group：
+1. 在 `kinematics.yaml` 中配置了 IK solver；
+2. 在 SRDF 中定义为 `<chain>`。
+
+脚本只按候选**数量**自动识别，**不依据 group 名猜测**。约定如下：
+
+- **单臂**：SRDF 中为机械臂定义一个 `<chain>` group，并在 `kinematics.yaml` 中**只**给它配置 IK。躯干等非臂 chain 若无笛卡尔需求，**不要**写入 `kinematics.yaml`。满足即可自动识别为 `single`。
+- **双臂**：左右臂各定义一个 `<chain>` group，各配一个 IK；group 名需包含 `left` / `right`（如 `left_arm` / `right_arm`）。满足即可自动识别为 `dual`。
+
+若配置不满足上述约定（例如躯干也被配了 IK，导致候选 ≥2 且无法区分左右），脚本会报错并列出候选 group。此时用下列参数**显式指定**即可（显式参数优先级最高）：
+
+```bash
+# 单臂：显式指定机械臂 group
+python scripts/patch_moveit_config.py \
+  --package-path <moveit_pkg> \
+  --prefab-config <xxx_config.yaml> \
+  --arm-group <arm_group_name>
+
+# 双臂：显式指定左右臂 group
+python scripts/patch_moveit_config.py \
+  --package-path <moveit_pkg> \
+  --prefab-config <xxx_config.yaml> \
+  --left-arm-group <left_group> \
+  --right-arm-group <right_group>
+```
+
+> `--arm-group` 与 `--left-arm-group`/`--right-arm-group` 互斥；双臂必须同时提供 left/right 两个。
 
 ---
 
@@ -127,20 +168,20 @@ ur5e_description/
 
 ---
 
-## `ur5e_gripper_controller/` —— 夹爪 ros2_control 控制器
+## `ur5e_gripper_controller/` —— 夹爪控制器
 
-自定义 ros2_control 硬件接口实现，用于把 MoveIt 的位置命令转换为夹爪控制信号。
+把**高层**夹爪命令翻译成**低层**关节位置命令的 ROS2 节点：订阅 `gripper_command_topic`（`Float64`，`0.1=开 / 0.0=关`），按 `ur5e.yaml` 的 `gripper_positions` 线性映射成每根手指的关节值，发布到低层 `topic_name`（`Float64MultiArray`）。
 
 ```
 ur5e_gripper_controller/
 ├── CMakeLists.txt               # ament_cmake 构建
-├── package.xml                  # ROS2 包描述（依赖 rclcpp / hardware_interface 等）
+├── package.xml                  # ROS2 包描述
 └── src/
-    └── ur5e_gripper_controller.cpp   # 控制器实现
+    └── ur5e_gripper_controller.cpp   # 控制器实现（由脚本生成）
 ```
 
-- `CMakeLists.txt` / `package.xml`：声明 ros2_control 控制器插件导出。
-- `src/ur5e_gripper_controller.cpp`：实现 `hardware_interface::SystemInterface` 或 `ControllerInterface`，负责在 `read()` / `write()` 周期与底层夹爪硬件通信。
+- `CMakeLists.txt` / `package.xml`：构建与安装可执行文件。
+- `src/ur5e_gripper_controller.cpp`：**由 `scripts/generate_gripper_controller.py` 根据 `<robot>.yaml` 自动生成，请勿手工修改**。脚本还会触发 `patch_moveit_config.py` 扫描其中的订阅 topic，写入 `robot_profile.yaml` 的 `gripper_controller` 字段。
 
 ---
 

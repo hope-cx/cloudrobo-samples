@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -275,6 +276,23 @@ def create_new_project(source_dir, target_dir, robot_name):
         dirnames[:] = new_dirnames
 
 
+def init_metadata(target_robot_dir, robot_name):
+    """在目标机器人目录下生成一份初版 metadata.json"""
+    metadata_path = os.path.join(target_robot_dir, "metadata.json")
+    os.makedirs(target_robot_dir, exist_ok=True)
+
+    metadata = {
+        "robot_type": robot_name,
+        "record_topic": [],
+    }
+
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+
+    print(f"已生成初版 metadata.json: {metadata_path}")
+
+
 def main():
     # 1. 获取机器人名称
     if len(sys.argv) > 1:
@@ -304,6 +322,10 @@ def main():
 
     # 3. 执行创建
     create_new_project(source_dir, target_dir, robot_name)
+
+    # 4. 最后初始化初版 metadata.json
+    target_robot_dir = os.path.join(target_dir, "Assets", "robots", f"robot_{robot_name}")
+    init_metadata(target_robot_dir, robot_name)
 
     print("-" * 50)
     print("新工程创建完成！")

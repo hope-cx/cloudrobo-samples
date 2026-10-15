@@ -181,7 +181,7 @@ ur5e_gripper_controller/
 ```
 
 - `CMakeLists.txt` / `package.xml`：构建与安装可执行文件。
-- `src/ur5e_gripper_controller.cpp`：**由 `scripts/generate_gripper_controller.py` 根据 `<robot>.yaml` 自动生成，请勿手工修改**。脚本还会触发 `patch_moveit_config.py` 扫描其中的订阅 topic，写入 `robot_profile.yaml` 的 `gripper_controller` 字段。
+- `src/ur5e_gripper_controller.cpp`：**由 `scripts/generate_gripper_controller.py` 根据 `<robot>.yaml` 自动生成，请勿手工修改**。随后由 `patch_moveit_config.py` 扫描该 C++ 中的 `Float64` 订阅 topic（`--gripper-controller-path`，默认自动查找 `*_gripper_controller` 目录），写入 `robot_profile.yaml` 的 `gripper_controller` 字段。
 
 ---
 
@@ -208,8 +208,45 @@ ur5e_transformer/
 
 ## 项目初始化
 
-通过 `scripts/init_project.py` 新建名字为 `robot_<新名字>/`的新工程：
+所有脚本都在 `custom-robot/` 根目录下运行，并且会**自动探测唯一的 `robot_<name>` 工程**（当模板 `robot_ur5e` 与目标机器人共存时，选非 `ur5e` 的那个）。
+
+### 步骤 1：创建工程
+
+通过 `scripts/init_project.py` 新建名字为 `robot_<新名字>/`的新工程，并写入初版 `metadata.json`：
 
 ```bash
 python scripts/init_project.py <新机器人名>
 ```
+
+### 完整流程（按生成依赖排序）
+
+`init_project.py` 会把模板里的 MoveIt 配置、URDF、mesh 等清空为占位内容，所以**先用手工补齐你自己的 MoveIt Assistant 配置包与 URDF**，再按下列顺序运行生成脚本。
+
+| 顺序 | 步骤 | 作用 | 输入 → 输出 |
+| --- | --- | --- | --- |
+| 1 | `init_project.py <name>` | 复制模板、改名、清空占位、写初版 metadata | `robot_ur5e/` → `robot_<name>/` |
+| 2 | （手工）补齐 MoveIt 配置与 URDF | 填回被清空的 `<name>_config/` 与 `<name>_description/urdf/` | MoveIt Assistant 包 + URDF |
+| 3 | `generate_robot_yaml.py` | 由 URDF/SRDF/MoveIt 生成机器人配置 | URDF+SRDF+controllers → `<name>.yaml` |
+| 4 | `generate_gripper_controller.py` | 生成夹爪控制器 C++ | `<name>.yaml` → `<name>_gripper_controller/src/*.cpp` |
+| 5 | `patch_moveit_config.py` | 扫描夹爪 C++、生成机器人档案 | C++ → `robot_profile.yaml` |
+| 6 | `generate_metadata.py` | 生成 `record_topic` | `<name>.yaml`+controllers → `metadata.json` |
+
+**依赖关系：**
+
+- `generate_robot_yaml.py` 需要 `<name>_config/config` 与 `<name>_description/urdf` **已经填好**。若缺失且仓库里仍有模板 `robot_ur5e`，它会**退回并基于模板 ur5e 生成**——所以务必先完成步骤 2。
+- `generate_gripper_controller.py` 依赖 `<name>.yaml`（步骤 3 的产物）。
+- `patch_moveit_config.py` 需要在 `generate_gripper_controller.py` **之后**运行，才能扫描到生成的夹爪 C++（`--gripper-controller-path`，默认自动查找）。
+- `generate_robot_yaml.py` 输出的 `fixed_base` **故意留空**，需手工填写后再继续后续步骤。
+
+```bash
+cd samples/robot-integration/robot-asset-onboarding/custom-robot
+
+python scripts/init_project.py <新机器人名>           # 1
+# 2 手工放入 MoveIt Assistant 配置包与 URDF
+python scripts/generate_robot_yaml.py                 # 3（生成后手填 fixed_base）
+python scripts/generate_gripper_controller.py         # 4
+python scripts/patch_moveit_config.py                 # 5
+python scripts/generate_metadata.py                   # 6
+```
+
+> 各脚本的具体参数（`--package-path` / `--prefab-config` 等）以其 `--help` 为准；正常使用下多数路径都能自动探测。

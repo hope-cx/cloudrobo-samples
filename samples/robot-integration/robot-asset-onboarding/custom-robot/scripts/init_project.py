@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -300,6 +301,17 @@ def main():
     else:
         robot_name = DEFAULT_ROBOT_NAME
         print(f"未指定机器人名称，使用默认值: {robot_name}")
+
+    # 全局机器人名只在此处校验一次：字母/下划线开头，仅含字母、数字、下划线
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", robot_name):
+        print(
+            f"[错误] 非法机器人名 {robot_name!r}：必须以字母或下划线开头，"
+            "且只能包含字母、数字、下划线"
+        )
+        sys.exit(1)
+    if robot_name == "ur5e":
+        print("[错误] 机器人名不能为 'ur5e'（会覆盖模板工程 robot_ur5e）")
+        sys.exit(1)
 
     # 2. 动态定位路径
     script_dir = os.path.dirname(os.path.abspath(__file__))

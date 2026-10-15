@@ -43,12 +43,14 @@ Final design rules
 8. Exactly ONE JointTrajectoryController is supported by the current O3DE
    integration. ros2_controllers.yaml and moveit_controllers.yaml must:
       - name the same controller
-      - list the same joints in the same order
+      - contain the same joint set (list order may differ)
    The controller must cover all movable URDF joints used by this platform.
 9. topic_controller is generated ONLY for platform roles:
-      single: arm, optional hand
-      dual:   optional right_gripper, optional left_gripper, left_arm, right_arm
-   Extra SRDF groups such as r1_init, torso_full, r1_robot never create topics.
+      single: arm, optional hand, optional torso
+      dual:   optional right_gripper, optional left_gripper, left_arm, right_arm,
+              optional torso
+   A torso is generated only when SRDF contains an exact direct-joint group
+   named 'torso'. Other extra SRDF groups are ignored.
 10. Topic names follow the current platform convention and are not guessed from
     Planning Group names.
 """
@@ -79,6 +81,7 @@ LEFT_GRIPPER_TOPIC = "/left_gripper_position_controller/commands"
 RIGHT_GRIPPER_TOPIC = "/right_gripper_position_controller/commands"
 LEFT_GRIPPER_COMMAND_TOPIC = "/left_gripper_controller"
 RIGHT_GRIPPER_COMMAND_TOPIC = "/right_gripper_controller"
+TORSO_TOPIC = "/torso_position_controller/commands"
 
 SUPPORTED_MOVABLE_JOINT_TYPES = {"revolute", "continuous", "prismatic"}
 
@@ -606,6 +609,32 @@ def _resolve_dual_grippers(groups: dict, group_states: List[dict]) -> dict:
     }
 
 
+def _optional_torso_joints(groups: dict) -> Optional[List[str]]:
+    """Return joints from the exact direct-joint Planning Group named 'torso'."""
+    if "torso" not in groups:
+        return None
+
+    cfg = groups["torso"]
+    if cfg.get("chain") is not None:
+        raise ValueError(
+            "SRDF Planning Group 'torso' must be a direct-joint group, not a <chain> group"
+        )
+    if cfg.get("subgroups"):
+        raise ValueError(
+            "SRDF Planning Group 'torso' must list joints directly; "
+            "subgroups are not supported for automatic torso generation"
+        )
+
+    joints = list(cfg.get("joints", []))
+    if not joints:
+        raise ValueError(
+            "SRDF Planning Group 'torso' exists but contains no direct <joint> entries"
+        )
+    if len(joints) != len(set(joints)):
+        raise ValueError(f"SRDF Planning Group 'torso' contains duplicate joints: {joints}")
+    return joints
+
+
 # -----------------------------------------------------------------------------
 # Controller contract validation
 # -----------------------------------------------------------------------------
@@ -700,16 +729,28 @@ def _validate_controller_contract(
             f"moveit_controllers.yaml: {ros2_name!r} != {moveit_name!r}"
         )
 
-    if ros2_joints != moveit_joints:
+    ros2_set = set(ros2_joints)
+    moveit_set = set(moveit_joints)
+    if ros2_set != moveit_set:
+        missing_in_moveit = [j for j in ros2_joints if j not in moveit_set]
+        missing_in_ros2 = [j for j in moveit_joints if j not in ros2_set]
         raise ValueError(
-            "Controller joint list mismatch between ros2_controllers.yaml and "
-            "moveit_controllers.yaml. They must contain the same joints in the "
-            f"same order.\nROS2:   {ros2_joints}\nMoveIt: {moveit_joints}"
+            "Controller joint mismatch between ros2_controllers.yaml and "
+            "moveit_controllers.yaml. They must contain the same joint set; "
+            "list order may differ. "
+            f"missing_in_moveit={missing_in_moveit}, "
+            f"missing_in_ros2={missing_in_ros2}"
         )
 
-    if len(ros2_joints) != len(set(ros2_joints)):
+    if len(ros2_joints) != len(ros2_set):
         raise ValueError(
-            f"Controller {ros2_name!r} contains duplicate joints: {ros2_joints}"
+            f"Controller {ros2_name!r} contains duplicate joints in "
+            f"ros2_controllers.yaml: {ros2_joints}"
+        )
+    if len(moveit_joints) != len(moveit_set):
+        raise ValueError(
+            f"Controller {moveit_name!r} contains duplicate joints in "
+            f"moveit_controllers.yaml: {moveit_joints}"
         )
 
     controller_set = set(ros2_joints)
@@ -1016,6 +1057,15 @@ def generate_config(paths: dict) -> Tuple[OrderedDict, dict]:
             [
                 ("topic_name", RIGHT_ARM_TOPIC),
                 ("joint_names", right_arm_joints),
+            ]
+        )
+
+    torso_joints = _optional_torso_joints(groups)
+    if torso_joints is not None:
+        topic_controller["torso"] = OrderedDict(
+            [
+                ("topic_name", TORSO_TOPIC),
+                ("joint_names", torso_joints),
             ]
         )
 

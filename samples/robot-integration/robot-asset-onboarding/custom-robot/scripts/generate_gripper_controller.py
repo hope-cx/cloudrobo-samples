@@ -3,9 +3,11 @@
 """Generate the ROS 2 gripper controller from <robot>.yaml.
 
 Normal usage:
-    python3 scripts/generate_gripper_controller.py
+    python3 /obs/scripts/generate_gripper_controller.py \
+      --yaml /data/workspace/eail/Assets/robots/robot_abc/abc.yaml
 
-The script auto-detects the single target robot created by init_project.py.
+The input robot YAML is explicit. The script derives the sibling
+<robot>_gripper_controller package and generated C++ output path from it.
 It does not read SRDF directly. generate_robot_yaml.py has already normalized
 SRDF open/close states into <robot>.yaml:
 
@@ -404,68 +406,6 @@ int main(int argc, char * argv[])
 '''
 
 
-def _robot_layout_candidates(root: Path) -> list[dict[str, Path | str]]:
-    result: list[dict[str, Path | str]] = []
-    for outer in sorted(root.glob("robot_*")):
-        if not outer.is_dir():
-            continue
-        robot_name = outer.name[len("robot_") :]
-        if not robot_name:
-            continue
-        robot_root = outer / "Assets" / "robots" / f"robot_{robot_name}"
-        if not robot_root.is_dir():
-            continue
-        result.append({
-            "robot": robot_name,
-            "robot_root": robot_root,
-        })
-    return result
-
-
-def _detect_robot_layout(root: Path) -> dict[str, Path | str]:
-    candidates = _robot_layout_candidates(root)
-    if len(candidates) == 1:
-        return candidates[0]
-    non_template = [c for c in candidates if c["robot"] != "ur5e"]
-    if len(non_template) == 1:
-        return non_template[0]
-    if not candidates:
-        raise ValueError(
-            f"cannot detect robot project under {root}; expected "
-            "robot_<name>/Assets/robots/robot_<name>"
-        )
-    raise ValueError(
-        "multiple target robots found; refusing to guess: "
-        f"{[c['robot'] for c in candidates]}"
-    )
-
-
-def _resolve_project_root(explicit_root: Optional[Path]) -> Path:
-    if explicit_root is not None:
-        root = explicit_root.expanduser().resolve()
-        if not root.is_dir():
-            raise ValueError(f"project root does not exist: {root}")
-        _detect_robot_layout(root)
-        return root
-
-    candidates = [Path.cwd().resolve(), Path(__file__).resolve().parent.parent]
-    seen: set[Path] = set()
-    errors: list[str] = []
-    for root in candidates:
-        if root in seen:
-            continue
-        seen.add(root)
-        try:
-            _detect_robot_layout(root)
-            return root
-        except ValueError as exc:
-            errors.append(str(exc))
-    raise ValueError(
-        "cannot locate custom-robot project root automatically; run from the "
-        "project root or pass --project-root. " + " | ".join(errors)
-    )
-
-
 def _safe_to_overwrite(path: Path) -> bool:
     if not path.exists():
         return True
@@ -489,22 +429,17 @@ def _print_mapping(label: str, cfg: GripperConfig) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--project-root",
+        "--yaml",
+        dest="robot_yaml",
         type=Path,
-        default=None,
-        help="custom-robot root; normally auto-detected",
-    )
-    parser.add_argument(
-        "--robot-yaml",
-        type=Path,
-        default=None,
-        help="optional explicit <robot>.yaml override",
+        required=True,
+        help="generated <robot>.yaml path",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="optional explicit generated .cpp output override",
+        help="optional generated .cpp output override",
     )
     parser.add_argument(
         "--force",
@@ -514,27 +449,29 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        project_root = _resolve_project_root(args.project_root)
-        layout = _detect_robot_layout(project_root)
-        robot_name = str(layout["robot"])
-        robot_root = Path(layout["robot_root"])
+        robot_yaml = args.robot_yaml.expanduser().resolve()
+        if not robot_yaml.is_file():
+            raise ValueError(
+                f"robot yaml not found: {robot_yaml}. "
+                "Run generate_robot_yaml.py first."
+            )
 
-        robot_yaml = (
-            args.robot_yaml.expanduser().resolve()
-            if args.robot_yaml
-            else robot_root / f"{robot_name}.yaml"
-        )
+        robot_name = robot_yaml.stem
+        if not robot_name:
+            raise ValueError(f"cannot derive robot name from YAML path: {robot_yaml}")
+
+        robot_root = robot_yaml.parent
         package_dir = robot_root / f"{robot_name}_gripper_controller"
+        if not package_dir.is_dir() and args.output is None:
+            raise ValueError(
+                f"gripper package not found: {package_dir}. Run init_project.py first."
+            )
+
         output_path = (
             args.output.expanduser().resolve()
             if args.output
             else package_dir / "src" / f"{robot_name}_gripper_controller.cpp"
         )
-
-        if not package_dir.is_dir() and args.output is None:
-            raise ValueError(
-                f"gripper package not found: {package_dir}. Run init_project.py first."
-            )
 
         layout_type, grippers = _detect_layout(robot_yaml)
         if layout_type == "single":
@@ -551,8 +488,9 @@ def main() -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
 
+        print(f"[INPUT] robot yaml: {robot_yaml}")
+        print(f"[CHECK] gripper package: {package_dir}")
         print(f"[OK] generated: {output_path}")
-        print(f"[INFO] source yaml: {robot_yaml}")
         print(
             f"[INFO] layout={layout_type}; high-level width protocol: "
             f"close={CLOSE_WIDTH}, open={OPEN_WIDTH}"
@@ -565,7 +503,6 @@ def main() -> None:
 
     except ValueError as exc:
         parser.error(str(exc))
-
 
 if __name__ == "__main__":
     main()

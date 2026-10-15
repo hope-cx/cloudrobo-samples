@@ -4,12 +4,14 @@
 """
 Generate <robot>.yaml for custom robot onboarding.
 
-Normal usage (run from custom-robot project root):
-    python3 scripts/generate_robot_yaml.py
+Normal usage:
+    python3 /obs/scripts/generate_robot_yaml.py \
+      --package-path /data/workspace/eail/Assets/robots/robot_abc/abc_config \
+      --urdf /data/workspace/eail/Assets/robots/robot_abc/abc_description/urdf/abc.urdf
 
-The script auto-detects the ONLY custom robot in the current project by finding
-one '<robot>_config' package with a matching '<robot>_description' package.
-Explicit file paths are optional overrides only.
+The MoveIt config package and URDF paths are explicit. The script derives only
+the robot name and default output <robot>.yaml from --package-path. It does not
+scan the workspace or guess the URDF location.
 
 Final design rules
 ==================
@@ -768,120 +770,8 @@ def _validate_controller_contract(
 
 
 # -----------------------------------------------------------------------------
-# Project path auto-detection
+# Explicit input path resolution
 # -----------------------------------------------------------------------------
-
-def _find_unique_file(directory: Path, pattern: str, label: str) -> Path:
-    matches = sorted(directory.glob(pattern)) if directory.is_dir() else []
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise ValueError(
-            f"Cannot auto-detect {label}: no {pattern!r} under {directory}"
-        )
-    raise ValueError(
-        f"Cannot auto-detect {label}: multiple matches under {directory}: "
-        f"{[str(path) for path in matches]}"
-    )
-
-
-def _robot_layout_candidates(root: Path) -> List[dict]:
-    """Find generated robot projects using the repository's real layout.
-
-    Layout created by init_project.py:
-      <root>/robot_<name>/Assets/robots/robot_<name>/
-        <name>_config/config/
-        <name>_description/urdf/
-        <name>.yaml
-
-    The repository also keeps robot_ur5e as the source/template project. When one
-    generated non-ur5e robot exists beside the template, the generated robot is
-    selected. If only robot_ur5e exists, the sample itself is selected.
-    """
-    result: List[dict] = []
-
-    for outer in sorted(root.glob("robot_*")):
-        if not outer.is_dir():
-            continue
-
-        prefix = outer.name[len("robot_") :]
-        if not prefix:
-            continue
-
-        robot_root = outer / "Assets" / "robots" / f"robot_{prefix}"
-        config_dir = robot_root / f"{prefix}_config" / "config"
-        urdf_dir = robot_root / f"{prefix}_description" / "urdf"
-
-        if not config_dir.is_dir() or not urdf_dir.is_dir():
-            continue
-
-        result.append(
-            {
-                "robot": prefix,
-                "outer": outer,
-                "robot_root": robot_root,
-                "config_dir": config_dir,
-                "urdf_dir": urdf_dir,
-            }
-        )
-
-    return result
-
-
-def _detect_robot_layout(root: Path) -> dict:
-    candidates = _robot_layout_candidates(root)
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    if not candidates:
-        raise ValueError(
-            f"Cannot detect robot project under {root}. Expected repository layout "
-            "robot_<name>/Assets/robots/robot_<name>/<name>_config + "
-            "<name>_description."
-        )
-
-    non_template = [c for c in candidates if c["robot"] != "ur5e"]
-    if len(non_template) == 1:
-        # init_project.py keeps robot_ur5e as the source template, so a single
-        # generated non-ur5e robot beside it is unambiguous.
-        return non_template[0]
-
-    raise ValueError(
-        "Multiple target robot projects found; generation is intentionally "
-        f"aborted instead of guessing: {[c['robot'] for c in candidates]}. "
-        "Use --project-root to point at a directory with one target robot."
-    )
-
-def _resolve_project_root(explicit_root: Optional[str]) -> Path:
-    if explicit_root:
-        root = Path(explicit_root).resolve()
-        if not root.is_dir():
-            raise ValueError(f"Project root does not exist: {root}")
-        return root
-
-    # Normal command is run from custom-robot root. If the user happens to run
-    # from scripts/, also try the script's parent directory.
-    candidates = [Path.cwd().resolve(), Path(__file__).resolve().parent.parent]
-    seen = set()
-    errors = []
-
-    for root in candidates:
-        if root in seen:
-            continue
-        seen.add(root)
-        try:
-            _detect_robot_layout(root)
-            return root
-        except ValueError as exc:
-            errors.append(str(exc))
-
-    raise ValueError(
-        "Cannot locate the custom-robot project root automatically. "
-        "Run from the project root or pass --project-root. Details: "
-        + " | ".join(errors)
-    )
-
 
 def _require_file(path: Path, label: str) -> Path:
     if not path.is_file():
@@ -889,57 +779,64 @@ def _require_file(path: Path, label: str) -> Path:
     return path
 
 
+def _find_unique_file(directory: Path, pattern: str, label: str) -> Path:
+    matches = sorted(directory.glob(pattern))
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one {label} under {directory}, found: "
+            f"{[p.name for p in matches]}"
+        )
+    return matches[0]
+
+
 def _resolve_paths(args) -> dict:
-    root = _resolve_project_root(args.project_root)
-    layout = _detect_robot_layout(root)
-    robot = layout["robot"]
-    config_dir = layout["config_dir"]
-    urdf_dir = layout["urdf_dir"]
-    robot_root = layout["robot_root"]
+    package_path = Path(args.package_path).expanduser().resolve()
+    if not package_path.is_dir():
+        raise ValueError(f"MoveIt config package not found: {package_path}")
 
-    if args.urdf:
-        urdf = _require_file(Path(args.urdf).resolve(), "URDF")
-    else:
-        preferred = urdf_dir / f"{robot}.urdf"
-        urdf = preferred if preferred.is_file() else _find_unique_file(
-            urdf_dir, "*.urdf", "URDF"
+    package_name = package_path.name
+    if not package_name.endswith("_config") or package_name == "_config":
+        raise ValueError(
+            "--package-path must point to a <robot>_config package, got: "
+            f"{package_path}"
         )
 
-    if args.srdf:
-        srdf = _require_file(Path(args.srdf).resolve(), "SRDF")
-    else:
-        preferred = config_dir / f"{robot}.srdf"
-        srdf = preferred if preferred.is_file() else _find_unique_file(
-            config_dir, "*.srdf", "SRDF"
-        )
+    robot = package_name[:-len("_config")]
+    robot_root = package_path.parent
+    config_dir = package_path / "config"
+    if not config_dir.is_dir():
+        raise ValueError(f"MoveIt config directory not found: {config_dir}")
 
-    kinematics = _require_file(
-        Path(args.kinematics).resolve()
-        if args.kinematics
-        else config_dir / "kinematics.yaml",
-        "kinematics.yaml",
+    urdf = _require_file(
+        Path(args.urdf).expanduser().resolve(),
+        "URDF",
     )
+
+    preferred_srdf = config_dir / f"{robot}.srdf"
+    srdf = (
+        preferred_srdf
+        if preferred_srdf.is_file()
+        else _find_unique_file(config_dir, "*.srdf", "SRDF")
+    )
+
+    kinematics = _require_file(config_dir / "kinematics.yaml", "kinematics.yaml")
     ros2_controllers = _require_file(
-        Path(args.ros2_controllers).resolve()
-        if args.ros2_controllers
-        else config_dir / "ros2_controllers.yaml",
+        config_dir / "ros2_controllers.yaml",
         "ros2_controllers.yaml",
     )
     moveit_controllers = _require_file(
-        Path(args.moveit_controllers).resolve()
-        if args.moveit_controllers
-        else config_dir / "moveit_controllers.yaml",
+        config_dir / "moveit_controllers.yaml",
         "moveit_controllers.yaml",
     )
 
     output = (
-        Path(args.output).resolve()
+        Path(args.output).expanduser().resolve()
         if args.output
         else robot_root / f"{robot}.yaml"
     )
 
     return {
-        "root": root,
+        "package_path": package_path,
         "robot": robot,
         "urdf": urdf,
         "srdf": srdf,
@@ -948,7 +845,6 @@ def _resolve_paths(args) -> dict:
         "moveit_controllers": moveit_controllers,
         "output": output,
     }
-
 
 # -----------------------------------------------------------------------------
 # YAML generation
@@ -1139,37 +1035,23 @@ def _write_config(cfg: OrderedDict, output: Path):
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Generate the only custom robot's <robot>.yaml from conventional "
-            "<robot>_description + <robot>_config layout. Normal use requires "
-            "no arguments."
-        )
-    )
-
-    parser.add_argument(
-        "--project-root",
-        help=(
-            "Optional project root override. Normally run from custom-robot root "
-            "and omit this option."
-        ),
-    )
-
-    # File paths are overrides only, not part of normal usage.
-    parser.add_argument("--urdf", help="Optional URDF path override")
-    parser.add_argument("--srdf", help="Optional SRDF path override")
-    parser.add_argument("--kinematics", help="Optional kinematics.yaml override")
-    parser.add_argument(
-        "--ros2-controllers",
-        help="Optional ros2_controllers.yaml override",
+        description="Generate <robot>.yaml from an explicit MoveIt config package."
     )
     parser.add_argument(
-        "--moveit-controllers",
-        help="Optional moveit_controllers.yaml override",
+        "--package-path",
+        required=True,
+        help="MoveIt config package path, e.g. .../robot_abc/abc_config",
     )
-    parser.add_argument("--output", help="Optional output YAML path override")
-
+    parser.add_argument(
+        "--urdf",
+        required=True,
+        help="URDF file path, e.g. .../robot_abc/abc_description/urdf/abc.urdf",
+    )
+    parser.add_argument(
+        "--output",
+        help="Optional output path. Default: sibling <robot>.yaml",
+    )
     return parser
-
 
 def main() -> int:
     args = build_arg_parser().parse_args()

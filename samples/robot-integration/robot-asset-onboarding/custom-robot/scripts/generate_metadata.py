@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """Generate/update metadata.json from the final robot YAML and MoveIt config.
 
-Normal usage:
-    python3 scripts/generate_metadata.py
+Normal usage for a robot with gripper:
+    python3 /obs/scripts/generate_metadata.py \
+      --gripper-package-path /data/workspace/eail/Assets/robots/robot_abc/abc_gripper_controller
+
+For a robot without a gripper, pass --robot-yaml instead.
 
 Assumptions fixed by the current O3DE integration:
 - exactly one JointTrajectoryController in ros2_controllers.yaml;
@@ -86,67 +89,6 @@ def _validate_joint_list(value: Any, where: str) -> list[str]:
     if len(joints) != len(set(joints)):
         raise ValueError(f"{where} contains duplicate joint names")
     return joints
-
-
-def _robot_layout_candidates(root: Path) -> list[dict[str, Path | str]]:
-    result: list[dict[str, Path | str]] = []
-    for outer in sorted(root.glob("robot_*")):
-        if not outer.is_dir():
-            continue
-        robot_name = outer.name[len("robot_") :]
-        if not robot_name:
-            continue
-        robot_root = outer / "Assets" / "robots" / f"robot_{robot_name}"
-        if robot_root.is_dir():
-            result.append({
-                "robot": robot_name,
-                "robot_root": robot_root,
-            })
-    return result
-
-
-def _detect_robot_layout(root: Path) -> dict[str, Path | str]:
-    candidates = _robot_layout_candidates(root)
-    if len(candidates) == 1:
-        return candidates[0]
-    non_template = [c for c in candidates if c["robot"] != "ur5e"]
-    if len(non_template) == 1:
-        return non_template[0]
-    if not candidates:
-        raise ValueError(
-            f"cannot detect robot project under {root}; expected "
-            "robot_<name>/Assets/robots/robot_<name>"
-        )
-    raise ValueError(
-        "multiple target robots found; refusing to guess: "
-        f"{[c['robot'] for c in candidates]}"
-    )
-
-
-def _resolve_project_root(explicit_root: Optional[Path]) -> Path:
-    if explicit_root is not None:
-        root = explicit_root.expanduser().resolve()
-        if not root.is_dir():
-            raise ValueError(f"project root does not exist: {root}")
-        _detect_robot_layout(root)
-        return root
-
-    candidates = [Path.cwd().resolve(), Path(__file__).resolve().parent.parent]
-    seen: set[Path] = set()
-    errors: list[str] = []
-    for root in candidates:
-        if root in seen:
-            continue
-        seen.add(root)
-        try:
-            _detect_robot_layout(root)
-            return root
-        except ValueError as exc:
-            errors.append(str(exc))
-    raise ValueError(
-        "cannot locate custom-robot project root automatically; run from the "
-        "project root or pass --project-root. " + " | ".join(errors)
-    )
 
 
 def _parse_ros2_controller(path: Path) -> tuple[str, list[str]]:
@@ -421,17 +363,88 @@ def _camera_topics(existing: dict[str, Any]) -> list[str]:
     return result
 
 
+def _resolve_metadata_inputs(args) -> tuple[str, Path, Path, Path, Path, Optional[Path]]:
+    """Resolve explicit metadata inputs without scanning the workspace."""
+    gripper_source: Optional[Path] = None
+
+    if args.gripper_package_path is not None:
+        gripper_package = args.gripper_package_path.expanduser().resolve()
+        if not gripper_package.is_dir():
+            raise ValueError(f"gripper package not found: {gripper_package}")
+
+        suffix = "_gripper_controller"
+        if not gripper_package.name.endswith(suffix) or gripper_package.name == suffix:
+            raise ValueError(
+                "--gripper-package-path must point to a <robot>_gripper_controller "
+                f"package, got: {gripper_package}"
+            )
+
+        robot_name = gripper_package.name[:-len(suffix)]
+        robot_root = gripper_package.parent
+        robot_yaml_path = robot_root / f"{robot_name}.yaml"
+        gripper_source = (
+            gripper_package / "src" / f"{robot_name}_gripper_controller.cpp"
+        )
+        if not gripper_source.is_file():
+            raise ValueError(
+                f"gripper controller source not found: {gripper_source}. "
+                "Run generate_gripper_controller.py first."
+            )
+    else:
+        robot_yaml_path = args.robot_yaml.expanduser().resolve()
+        if not robot_yaml_path.is_file():
+            raise ValueError(f"robot yaml not found: {robot_yaml_path}")
+        robot_name = robot_yaml_path.stem
+        robot_root = robot_yaml_path.parent
+
+    if not robot_yaml_path.is_file():
+        raise ValueError(
+            f"robot yaml not found: {robot_yaml_path}. Run generate_robot_yaml.py first."
+        )
+
+    config_dir = robot_root / f"{robot_name}_config" / "config"
+    if not config_dir.is_dir():
+        raise ValueError(f"MoveIt config directory not found: {config_dir}")
+
+    ros2_controllers_path = config_dir / "ros2_controllers.yaml"
+    moveit_controllers_path = config_dir / "moveit_controllers.yaml"
+    if not ros2_controllers_path.is_file():
+        raise ValueError(f"ros2_controllers.yaml not found: {ros2_controllers_path}")
+    if not moveit_controllers_path.is_file():
+        raise ValueError(f"moveit_controllers.yaml not found: {moveit_controllers_path}")
+
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output
+        else robot_root / "metadata.json"
+    )
+
+    return (
+        robot_name,
+        robot_yaml_path,
+        ros2_controllers_path,
+        moveit_controllers_path,
+        output_path,
+        gripper_source,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--project-root",
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--gripper-package-path",
         type=Path,
-        default=None,
-        help="custom-robot root; normally auto-detected",
+        help=(
+            "<robot>_gripper_controller package path. For robots with grippers, "
+            "this also verifies the generated controller source exists."
+        ),
     )
-    parser.add_argument("--robot-yaml", type=Path, default=None)
-    parser.add_argument("--ros2-controllers", type=Path, default=None)
-    parser.add_argument("--moveit-controllers", type=Path, default=None)
+    source_group.add_argument(
+        "--robot-yaml",
+        type=Path,
+        help="<robot>.yaml path for robots without a gripper",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
         "--extra-topic",
@@ -447,34 +460,27 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        project_root = _resolve_project_root(args.project_root)
-        layout = _detect_robot_layout(project_root)
-        robot_name = str(layout["robot"])
-        robot_root = Path(layout["robot_root"])
-        config_dir = robot_root / f"{robot_name}_config" / "config"
-
-        robot_yaml_path = (
-            args.robot_yaml.expanduser().resolve()
-            if args.robot_yaml
-            else robot_root / f"{robot_name}.yaml"
-        )
-        ros2_controllers_path = (
-            args.ros2_controllers.expanduser().resolve()
-            if args.ros2_controllers
-            else config_dir / "ros2_controllers.yaml"
-        )
-        moveit_controllers_path = (
-            args.moveit_controllers.expanduser().resolve()
-            if args.moveit_controllers
-            else config_dir / "moveit_controllers.yaml"
-        )
-        output_path = (
-            args.output.expanduser().resolve()
-            if args.output
-            else robot_root / "metadata.json"
-        )
+        (
+            robot_name,
+            robot_yaml_path,
+            ros2_controllers_path,
+            moveit_controllers_path,
+            output_path,
+            gripper_source,
+        ) = _resolve_metadata_inputs(args)
 
         robot_yaml = _load_yaml(robot_yaml_path)
+        topic_controller = robot_yaml.get("topic_controller")
+        has_gripper = isinstance(topic_controller, dict) and any(
+            role in topic_controller
+            for role in ("hand", "left_gripper", "right_gripper")
+        )
+        if has_gripper and gripper_source is None:
+            raise ValueError(
+                f"{robot_yaml_path.name} contains gripper configuration; use "
+                "--gripper-package-path so the generated gripper controller is checked."
+            )
+
         controller_name, controller_joints, action_ns = _validate_controller_contract(
             robot_yaml,
             robot_yaml_path,
@@ -502,6 +508,11 @@ def main() -> None:
         text = json.dumps(metadata, ensure_ascii=False, indent=2) + "\n"
         print(text, end="")
 
+        print(f"[INPUT] robot yaml: {robot_yaml_path}")
+        print(f"[INPUT] MoveIt config: {moveit_controllers_path.parent}")
+        if gripper_source is not None:
+            print(f"[CHECK] gripper controller: {gripper_source}")
+
         if args.dry_run:
             print("[DRY-RUN] metadata.json not written")
             return
@@ -514,7 +525,6 @@ def main() -> None:
 
     except ValueError as exc:
         parser.error(str(exc))
-
 
 if __name__ == "__main__":
     main()

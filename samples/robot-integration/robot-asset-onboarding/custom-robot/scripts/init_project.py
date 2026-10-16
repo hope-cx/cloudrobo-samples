@@ -277,6 +277,19 @@ def create_new_project(source_dir, target_dir, robot_name):
         dirnames[:] = new_dirnames
 
 
+def copy_scripts(script_dir, target_dir):
+    """把 scripts/ 复制到目标工程，使其与 Assets/ 平级"""
+    target_scripts = os.path.join(target_dir, "scripts")
+    if os.path.exists(target_scripts):
+        shutil.rmtree(target_scripts)
+    shutil.copytree(
+        script_dir,
+        target_scripts,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    print(f"[脚本] 已复制 scripts -> {target_scripts}")
+
+
 def init_metadata(target_robot_dir, robot_name):
     """在目标机器人目录下生成一份初版 metadata.json"""
     metadata_path = os.path.join(target_robot_dir, "metadata.json")
@@ -335,7 +348,10 @@ def main():
     # 3. 执行创建
     create_new_project(source_dir, target_dir, robot_name)
 
-    # 4. 最后初始化初版 metadata.json
+    # 4. 复制 scripts 到目标工程（与 Assets 平级）
+    copy_scripts(script_dir, target_dir)
+
+    # 5. 最后初始化初版 metadata.json
     target_robot_dir = os.path.join(target_dir, "Assets", "robots", f"robot_{robot_name}")
     init_metadata(target_robot_dir, robot_name)
 

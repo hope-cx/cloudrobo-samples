@@ -9,9 +9,14 @@ Normal usage:
       --package-path /data/workspace/eail/Assets/robots/robot_abc/abc_config \
       --urdf /data/workspace/eail/Assets/robots/robot_abc/abc_description/urdf/abc.urdf
 
-The MoveIt config package and URDF paths are explicit. The script derives only
-the robot name and default output <robot>.yaml from --package-path. It does not
-scan the workspace or guess the URDF location.
+Xacro input is also supported explicitly:
+    python3 /obs/scripts/generate_robot_yaml.py \
+      --package-path /data/workspace/eail/Assets/robots/robot_abc/abc_config \
+      --urdf /data/workspace/eail/Assets/robots/robot_abc/abc_description/urdf/abc.urdf.xacro
+
+The MoveIt config package and robot-description paths are explicit. For a
+*.xacro / *.urdf.xacro input, the script expands Xacro first and then runs the
+same URDF parsing logic. It does not scan the workspace or guess the input file.
 
 Final design rules
 ==================
@@ -46,13 +51,13 @@ Final design rules
    integration. ros2_controllers.yaml and moveit_controllers.yaml must:
       - name the same controller
       - contain the same joint set (list order may differ)
-   The controller must cover all movable URDF joints used by this platform.
+   Other movable URDF joints are allowed and do not need to belong to the trajectory controller.
 9. topic_controller is generated ONLY for platform roles:
       single: arm, optional hand, optional torso
       dual:   optional right_gripper, optional left_gripper, left_arm, right_arm,
               optional torso
-   A torso is generated only when SRDF contains an exact direct-joint group
-   named 'torso'. Other extra SRDF groups are ignored.
+   A torso is generated only when SRDF contains exactly one direct-joint group
+   whose name contains 'torso' (case-insensitive). Other extra SRDF groups are ignored.
 10. Topic names follow the current platform convention and are not guessed from
     Planning Group names.
 """
@@ -60,6 +65,8 @@ Final design rules
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -105,13 +112,50 @@ def _parse_xml(path: Path) -> ET.Element:
         raise ValueError(f"Failed to parse XML file {path}: {exc}") from exc
 
 
+def _parse_robot_description(path: Path) -> ET.Element:
+    """Return the final URDF XML root for a .urdf or Xacro input.
+
+    Plain URDF is parsed directly. Files ending in .xacro (including
+    .urdf.xacro) are expanded with the ROS xacro executable first, so all
+    macros/includes/properties are resolved before the existing URDF logic runs.
+    """
+    if path.name.lower().endswith(".xacro"):
+        xacro_executable = shutil.which("xacro")
+        if xacro_executable is None:
+            raise ValueError(
+                "Xacro input was provided but the 'xacro' executable was not found in PATH. "
+                "Source the ROS environment first, e.g. 'source /opt/ros/humble/setup.bash'."
+            )
+
+        try:
+            result = subprocess.run(
+                [xacro_executable, str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            suffix = f": {detail}" if detail else ""
+            raise ValueError(f"Failed to expand Xacro file {path}{suffix}") from exc
+
+        try:
+            return ET.fromstring(result.stdout)
+        except ET.ParseError as exc:
+            raise ValueError(
+                f"Xacro expansion did not produce valid URDF XML for {path}: {exc}"
+            ) from exc
+
+    return _parse_xml(path)
+
+
 # -----------------------------------------------------------------------------
 # URDF
 # -----------------------------------------------------------------------------
 
 def _parse_urdf(urdf_path: Path):
-    """Parse URDF joints and build child_link -> parent joint map."""
-    root = _parse_xml(urdf_path)
+    """Parse URDF/Xacro joints and build child_link -> parent joint map."""
+    root = _parse_robot_description(urdf_path)
 
     joints: "OrderedDict[str, dict]" = OrderedDict()
     child_to_joint: Dict[str, dict] = {}
@@ -612,28 +656,47 @@ def _resolve_dual_grippers(groups: dict, group_states: List[dict]) -> dict:
 
 
 def _optional_torso_joints(groups: dict) -> Optional[List[str]]:
-    """Return joints from the exact direct-joint Planning Group named 'torso'."""
-    if "torso" not in groups:
+    """Return joints from the unique direct-joint Planning Group containing 'torso'."""
+    torso_groups = [
+        name for name in groups
+        if "torso" in name.lower()
+    ]
+
+    if not torso_groups:
         return None
 
-    cfg = groups["torso"]
+    if len(torso_groups) != 1:
+        raise ValueError(
+            f"Ambiguous torso Planning Groups: {torso_groups}. "
+            "Exactly one SRDF group name containing 'torso' is required."
+        )
+
+    group_name = torso_groups[0]
+    cfg = groups[group_name]
+
     if cfg.get("chain") is not None:
         raise ValueError(
-            "SRDF Planning Group 'torso' must be a direct-joint group, not a <chain> group"
+            f"SRDF torso Planning Group {group_name!r} must be a direct-joint group, "
+            "not a <chain> group"
         )
+
     if cfg.get("subgroups"):
         raise ValueError(
-            "SRDF Planning Group 'torso' must list joints directly; "
+            f"SRDF torso Planning Group {group_name!r} must list joints directly; "
             "subgroups are not supported for automatic torso generation"
         )
 
     joints = list(cfg.get("joints", []))
     if not joints:
         raise ValueError(
-            "SRDF Planning Group 'torso' exists but contains no direct <joint> entries"
+            f"SRDF torso Planning Group {group_name!r} contains no direct <joint> entries"
         )
+
     if len(joints) != len(set(joints)):
-        raise ValueError(f"SRDF Planning Group 'torso' contains duplicate joints: {joints}")
+        raise ValueError(
+            f"SRDF torso Planning Group {group_name!r} contains duplicate joints: {joints}"
+        )
+
     return joints
 
 
@@ -755,17 +818,6 @@ def _validate_controller_contract(
             f"moveit_controllers.yaml: {moveit_joints}"
         )
 
-    controller_set = set(ros2_joints)
-    movable_set = set(all_movable_urdf_joints)
-    missing = [joint for joint in all_movable_urdf_joints if joint not in controller_set]
-    extra = [joint for joint in ros2_joints if joint not in movable_set]
-    if missing or extra:
-        raise ValueError(
-            "The single trajectory controller must cover all movable URDF joints "
-            "for the current O3DE integration. "
-            f"missing={missing}, extra={extra}"
-        )
-
     return ros2_name, ros2_joints
 
 
@@ -809,7 +861,7 @@ def _resolve_paths(args) -> dict:
 
     urdf = _require_file(
         Path(args.urdf).expanduser().resolve(),
-        "URDF",
+        "URDF/Xacro",
     )
 
     preferred_srdf = config_dir / f"{robot}.srdf"
@@ -1045,7 +1097,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--urdf",
         required=True,
-        help="URDF file path, e.g. .../robot_abc/abc_description/urdf/abc.urdf",
+        help=(
+            "URDF or Xacro file path, e.g. .../abc.urdf or .../abc.urdf.xacro"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -1066,7 +1120,7 @@ def main() -> int:
 
     print(f"[OK] Robot: {paths['robot']}")
     print(f"[OK] Generated: {paths['output']}")
-    print(f"[INPUT] URDF: {paths['urdf']}")
+    print(f"[INPUT] Robot description: {paths['urdf']}")
     print(f"[INPUT] SRDF: {paths['srdf']}")
     print(f"[INPUT] kinematics: {paths['kinematics']}")
     print(f"[INPUT] ros2_controllers: {paths['ros2_controllers']}")

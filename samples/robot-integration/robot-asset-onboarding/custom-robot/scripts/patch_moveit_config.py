@@ -23,10 +23,6 @@ robot_profile data sources:
   - arm controller topic: prefab config YAML
   - gripper command topic: prefab config YAML (topic_controller.*.gripper_command_topic)
 
-Controller policy:
-  - moveit_controllers.yaml and ros2_controllers.yaml are generated/configured
-    by MoveIt Setup Assistant and are never generated or overwritten here.
-
 Provide --package-path for in-place patching, plus an optional small
 --reference-config YAML for project-specific extras.
 Package name, robot name, and URDF file are inferred from the GUI-generated
@@ -322,6 +318,72 @@ def normalize_joint_limits(
     dump_yaml(limits_path, limits)
 
 
+def generated_controller_configs(reference: dict[str, Any]) -> dict[str, Any]:
+    controllers = configured_controllers(reference)
+    if not controllers:
+        return {}
+
+    ros2_control = reference.get("ros2_control", {})
+    if not isinstance(ros2_control, dict):
+        ros2_control = {}
+    default_command_interfaces = ros2_control.get("command_interfaces", [])
+    default_state_interfaces = ros2_control.get("state_interfaces", [])
+
+    moveit_simple: dict[str, Any] = {
+        "controller_names": [controller["name"] for controller in controllers],
+    }
+    controller_manager_params: dict[str, Any] = {
+        "update_rate": ros2_control.get("update_rate", 100),
+    }
+    ros2_config: dict[str, Any] = {
+        "controller_manager": {"ros__parameters": controller_manager_params},
+    }
+
+    for index, controller in enumerate(controllers):
+        name = controller["name"]
+        joints = controller.get("joints", [])
+        controller_manager_params[name] = {
+            "type": controller.get(
+                "ros2_type",
+                "joint_trajectory_controller/JointTrajectoryController",
+            )
+        }
+        moveit_simple[name] = {
+            "type": controller.get("moveit_type", "FollowJointTrajectory"),
+            "joints": joints,
+            "action_ns": controller.get("action_ns", "follow_joint_trajectory"),
+            "default": bool_from_string(controller.get("default", index == 0)),
+        }
+        ros2_config[name] = {
+            "ros__parameters": {
+                "joints": joints,
+                "command_interfaces": controller.get(
+                    "command_interfaces",
+                    default_command_interfaces,
+                ),
+                "state_interfaces": controller.get(
+                    "state_interfaces",
+                    default_state_interfaces,
+                ),
+            }
+        }
+
+    if ros2_control.get("joint_state_broadcaster", True):
+        controller_manager_params["joint_state_broadcaster"] = {
+            "type": "joint_state_broadcaster/JointStateBroadcaster"
+        }
+
+    return {
+        "moveit_controllers.yaml": {
+            "moveit_controller_manager": (
+                "moveit_simple_controller_manager/MoveItSimpleControllerManager"
+            ),
+            "moveit_simple_controller_manager": moveit_simple,
+        },
+        "ros2_controllers.yaml": ros2_config,
+    }
+
+
 def pilz_enabled(reference: dict[str, Any], args: argparse.Namespace) -> bool:
     if args.disable_pilz:
         return False
@@ -359,12 +421,36 @@ def sync_reference_configs(package_path: Path, reference: dict[str, Any], names:
         )
 
     generated = reference.get("generated_configs", {})
-    if not isinstance(generated, dict):
-        raise ValueError("reference.generated_configs must be a mapping")
     for filename in names:
         data = generated.get(filename)
         if data:
             dump_yaml(package_path / "config" / filename, data)
+
+
+def copy_config_file(root: Path, package_path: Path, source_arg: str, destination: str) -> None:
+    source = as_path(root, source_arg)
+    if not source or not source.is_file():
+        raise FileNotFoundError(f"config source not found: {source_arg}")
+    target = package_path / "config" / destination
+    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def ensure_trajectory_execution_config(package_path: Path) -> None:
+    path = package_path / "config" / "moveit_controllers.yaml"
+    if not path.exists():
+        return
+
+    data = load_yaml(path)
+    data.setdefault(
+        "trajectory_execution",
+        {
+            "allowed_execution_duration_scaling": 1.2,
+            "allowed_goal_duration_margin": 0.5,
+            "allowed_start_tolerance": 0.15,
+            "execution_duration_monitoring": True,
+        },
+    )
+    dump_yaml(path, data)
 
 
 def validate_moveit_config(package_path: Path) -> None:
@@ -694,8 +780,11 @@ def write_rviz_only_launch(
     """生成只启动 RViz 的 launch 文件，用于连接已有 runtime。"""
     content = f"""
     import os
+
+
     from ament_index_python.packages import get_package_share_directory
     from launch import LaunchDescription
+
     from launch_ros.actions import Node
     from moveit_configs_utils import MoveItConfigsBuilder
 
@@ -1215,15 +1304,28 @@ def write_robot_profile(
             selected_groups[1], "right"
         )
 
-    # 可选 torso：仅识别精确 Planning Group 名 "torso"。
-    # 其它 direct-joint Planning Group 不参与自动生成。
+    # 可选 torso：识别唯一一个名称中包含 "torso" 的 direct-joint Planning Group。
+    # 例如 torso / r1t_torso / robot_torso；若匹配到多个则拒绝猜测。
     if "torso" in topic_controllers:
         direct_joint_groups = _parse_srdf_direct_joint_groups(package_path, robot)
-        if "torso" not in direct_joint_groups:
+        torso_groups = [
+            name for name in direct_joint_groups
+            if "torso" in name.lower()
+        ]
+
+        if not torso_groups:
             raise ValueError(
                 "prefab config contains topic_controller.torso, but SRDF does not "
-                "contain an exact direct-joint Planning Group named 'torso'"
+                "contain a direct-joint Planning Group whose name contains 'torso'"
             )
+
+        if len(torso_groups) != 1:
+            raise ValueError(
+                "prefab config contains topic_controller.torso, but torso Planning "
+                f"Group is ambiguous. Matches: {torso_groups}"
+            )
+
+        torso_group = torso_groups[0]
 
         torso_controller = topic_controllers["torso"]
         if not isinstance(torso_controller, dict):
@@ -1234,7 +1336,7 @@ def write_robot_profile(
 
         torso_service = "torso_move_pose_server"
         profile["torso_config"] = {
-            "planning_group": "torso",
+            "planning_group": torso_group,
             "planning_service_name": torso_service,
             "execution_service_name": _derive_execution_service_name(torso_service),
             "controller_topic_name": _strip_slash(torso_topic),
@@ -1258,7 +1360,7 @@ def write_robot_profile(
         "#   tool_link              <- SRDF planning group chain.tip_link\n"
         "#   controller_topic_name  <- prefab config topic_controller\n"
         "#   gripper_controller     <- prefab config gripper_command_topic\n"
-        "#   torso_config           <- SRDF exact group 'torso' + prefab topic_controller.torso\n"
+        "#   torso_config           <- unique SRDF direct-joint group containing 'torso' + prefab topic_controller.torso\n"
         "#   planning/execution service names <- 轨迹生成 runtime naming convention\n"
         "#\n"
         "# 如果配置不正确，请优先修改机器人/MoveIt 的原始配置，\n"

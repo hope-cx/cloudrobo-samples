@@ -24,13 +24,13 @@ Assets/robots/robot_ur5e/
 ## 顶层文件
 
 ### `metadata.json`
-由脚本生成，`init_project.py` 生成初版、`generate_metadata.py` 自动补全 `robot_type` 与 `record_topic`；`camera_introduce` 等相机 topic 需手工补充。`robot_type` 标识机器人类型；`record_topic` 列出在数据回灌/同步录制时需要订阅的关键 ROS topic（包括关节状态、控制器命令、相机图像等）。
+由脚本生成但是仍需手动补全相机topic等，`init_project.py` 生成初版、`generate_metadata.py` 自动补全 `robot_type` 与 `record_topic`；`camera_introduce` 等相机 topic 需手工补充。`robot_type` 标识机器人类型；`record_topic` 列出在数据回灌/同步录制时需要订阅的关键 ROS topic（包括关节状态、控制器命令、相机图像等）。
 
 ### `robot_profile.yaml`
 无需手动填写，运行 `patch_moveit_config.py` 自动生成的机器人档案，描述机械臂构型（`single`）、MoveIt 配置包名、MoveIt 演示启动文件、任务类入口，以及臂/夹爪的 planning group、service 名称、控制器 topic、base/tool link 等关键映射参数。**请勿手工修改**，配置变更后重新运行 patch 脚本。机械臂 planning group 的识别规则见下方[《机械臂 planning group 约定》](#机械臂-planning-group-约定)。
 
 ### `ur5e.yaml`
-由脚本生成，`generate_robot_yaml.py` 自动生成，其中 `fixed_base` 故意留空，需手工补填后再继续。机器人控制器映射与初始位姿：
+由脚本生成但是仍需手动补全fixed_base以及可能没有正确解析出来的字段，`generate_robot_yaml.py` 自动生成，其中 `fixed_base` 留空，需手工补填后再继续。机器人控制器映射与初始位姿：
 - `fixed_base` / `moveit_controller`：底盘 link 与 MoveIt 主控制器名。
 - `topic_controller`：定义各角色对应的控制器映射。
   - `arm`（单臂）/ `left_arm` + `right_arm`（双臂）：机械臂的低层命令 topic 与关节名。
